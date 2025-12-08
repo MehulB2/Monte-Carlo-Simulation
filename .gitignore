@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+claims.db
+simulated_totals.csv
