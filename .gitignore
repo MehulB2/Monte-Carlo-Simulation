@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 claims.db
 simulated_totals.csv
+claims_from_dump.db
