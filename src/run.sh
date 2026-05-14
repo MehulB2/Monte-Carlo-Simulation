@@ -3,15 +3,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-python3 -m venv .venv
-# shellcheck source=/dev/null
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+pip3 install -q -r requirements.txt
 
-# generate a small db (fast)
-python src/create_db.py --out claims.db --n-policies 100 --n-years 1 --lambda-per-policy 0.05 --seed 1
-
-# run a short monte carlo smoke test
-python src/monte_carlo.py --db claims.db --n-sims 1000 --portfolio-size 100
+python3 src/create_db.py --out claims.db --n-policies 300 --n-years 3 --lambda-per-policy 0.1 --seed 1
+python3 src/monte_carlo.py --db claims.db --n-sims 1000 --seed 1
 echo "Done. See simulated_totals.csv"

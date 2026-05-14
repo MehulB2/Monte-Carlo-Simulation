@@ -1,217 +1,174 @@
 #!/usr/bin/env python3
-"""Fit frequency/severity from the SQL DB and run Monte Carlo simulations.
+"""Fit per-segment frequency/severity from SQL and run Monte Carlo simulations.
 
 This module:
-1. Loads historical claim data from SQLite database
-2. Fits a Poisson frequency distribution (claims per policy per year)
-3. Fits a Gamma severity distribution (claim amount distribution)
-4. Runs Monte Carlo simulations to generate portfolio loss distribution
-5. Computes portfolio-level risk metrics: VaR, percentiles, mean, volatility
+1. Uses SQL GROUP BY + JOIN to fit a Poisson lambda and log-normal severity per segment
+2. Runs vectorised Monte Carlo simulations, summing losses across segments
+3. Stores each run's results in simulation_runs / simulation_results tables in the DB
+4. Exports simulated_totals.csv for further analysis
 
-Exports a CSV `simulated_totals.csv` containing total portfolio loss per simulation.
+Segments (home / auto / commercial) are defined in create_db.py.
 """
 import argparse
+import datetime
 import sqlite3
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 
-def load_claims(db_path: str):
-    # Connect to database
-    conn = sqlite3.connect(db_path)
-    
-    # Query historical claim records
-    df = pd.read_sql_query("SELECT id, policy_id, claim_date, amount FROM claims", conn)
-    
-    # Query metadata table (stores portfolio info and parameters)
-    meta = dict(pd.read_sql_query("SELECT key, value FROM meta", conn).values)
-    
-    # Close connection
-    conn.close()
-    return df, meta
+def load_segment_params(db_path: str) -> dict:
+    """Return per-segment {lambda_per_policy, n_policies, mu, sigma} using SQL GROUP BY."""
+    with sqlite3.connect(db_path) as conn:
+        n_years = int(
+            pd.read_sql_query("SELECT value FROM meta WHERE key='n_years'", conn).iloc[0, 0]
+        )
+        policy_counts = pd.read_sql_query(
+            "SELECT segment, COUNT(*) as n_policies FROM policies GROUP BY segment", conn
+        )
+        claim_counts = pd.read_sql_query("""
+            SELECT p.segment, COUNT(c.id) as n_claims
+            FROM policies p
+            LEFT JOIN claims c ON c.policy_id = p.policy_id
+            GROUP BY p.segment
+        """, conn)
+        amounts_df = pd.read_sql_query("""
+            SELECT p.segment, c.amount
+            FROM claims c
+            JOIN policies p ON c.policy_id = p.policy_id
+        """, conn)
+
+    merged = policy_counts.merge(claim_counts, on="segment")
+    segment_params = {}
+
+    for _, row in merged.iterrows():
+        seg = row["segment"]
+        n_policies = int(row["n_policies"])
+        lambda_pp = int(row["n_claims"]) / (n_policies * n_years)
+
+        seg_amounts = amounts_df[amounts_df["segment"] == seg]["amount"].values.astype(float)
+        if len(seg_amounts) == 0:
+            mu, sigma = 0.0, 1.0
+        else:
+            mu = float(np.mean(np.log(seg_amounts)))
+            sigma = float(np.std(np.log(seg_amounts), ddof=1))
+
+        segment_params[seg] = dict(lambda_per_policy=lambda_pp, n_policies=n_policies, mu=mu, sigma=sigma)
+
+    return segment_params
 
 
-def fit_frequency(df: pd.DataFrame, meta: dict):
-    # Count total historical claims
-    n_claims = len(df)
-    
-    # Try to compute lambda from portfolio history
-    if "n_policies" in meta and "n_years" in meta:
-        # Empirical: lambda = total_claims / (policies * years)
-        n_policies = int(meta["n_policies"])
-        n_years = int(meta["n_years"])
-        lambda_per_policy = n_claims / (n_policies * n_years)
-    # Or use precomputed lambda from metadata
-    elif "lambda_per_policy" in meta:
-        lambda_per_policy = float(meta["lambda_per_policy"])
-    else:
-        raise RuntimeError("Meta data missing: cannot infer lambda_per_policy. Provide meta or precomputed value.")
-    
-    return lambda_per_policy
-
-
-def fit_severity(df: pd.DataFrame):
-    # Extract claim amounts and convert to float
-    amounts = df["amount"].values.astype(float)
-    
-    # Handle empty dataset
-    if len(amounts) == 0:
-        return None
-    
-    # Fit Gamma distribution: scipy.stats.gamma.fit(data, floc=0)
-    # floc=0 ensures location parameter is 0 (claims must be positive)
-    # Returns: shape parameter (a), location (loc=0), scale parameter
-    a, loc, scale = stats.gamma.fit(amounts, floc=0)
-    
-    # Return parameters as dictionary for later use in simulations
-    return dict(dist_name="gamma", a=float(a), loc=float(loc), scale=float(scale))
-
-
-def run_simulation(lambda_per_policy: float, severity_params: dict | None, portfolio_size: int, n_sims: int, rng=None):
-    # Initialize random generator if not provided
+def run_simulation(segment_params: dict, portfolio_size: int | None, n_sims: int, rng=None) -> np.ndarray:
     if rng is None:
         rng = np.random.default_rng()
-    
-    # Pre-allocate array to store total loss for each simulation
+
+    total_historical = sum(p["n_policies"] for p in segment_params.values())
     sim_totals = np.zeros(n_sims, dtype=float)
-    
-    # Compute effective portfolio-level Poisson parameter
-    # (claims per policy per year) × (number of policies) = total expected claims
-    lam = lambda_per_policy * portfolio_size
-    
-    # Handle case where no severity data available (no historical claims)
-    if severity_params is None:
-        # If no severity data, assume zero loss each simulation
-        for i in range(n_sims):
-            n = rng.poisson(lam)
-            sim_totals[i] = 0.0
-        return sim_totals
-    
-    # Extract Gamma distribution parameters
-    a = severity_params["a"]
-    scale = severity_params["scale"]
-    
-    # Run Monte Carlo simulation for each scenario
-    for i in range(n_sims):
-        # Step 1: Sample number of claims this year from Poisson distribution
-        n = rng.poisson(lam)
-        
-        # Step 2: If no claims, loss is 0
-        if n == 0:
-            sim_totals[i] = 0.0
-            continue
-        
-        # Step 3: Sample individual claim amounts from fitted Gamma distribution
-        # Repeat n times to get n claim amounts
-        samples = stats.gamma(a, scale=scale).rvs(size=n, random_state=rng)
-        
-        # Step 4: Sum all claims to get total portfolio loss this year
-        sim_totals[i] = samples.sum()
-    
+
+    for seg, params in segment_params.items():
+        # Scale each segment proportionally to its historical share of the portfolio
+        share = params["n_policies"] / total_historical
+        seg_size = round(portfolio_size * share) if portfolio_size else params["n_policies"]
+        lam = params["lambda_per_policy"] * seg_size
+
+        n_claims = rng.poisson(lam, size=n_sims)
+        mask = n_claims > 0
+        if mask.any():
+            all_samples = rng.lognormal(mean=params["mu"], sigma=params["sigma"], size=int(n_claims[mask].sum()))
+            splits = np.split(all_samples, np.cumsum(n_claims[mask])[:-1])
+            seg_totals = np.zeros(n_sims)
+            seg_totals[mask] = [s.sum() for s in splits]
+            sim_totals += seg_totals
+
     return sim_totals
 
 
-def summarize_sim(sim_totals: np.ndarray, quantiles=(0.5, 0.9, 0.95, 0.99)):
-
-    # ========== CENTRAL TENDENCY ==========
-    # Mean: Expected value of portfolio loss
-    mean = float(sim_totals.mean())
-    
-    # Volatility: Standard deviation of losses (measures risk dispersion)
-    # ddof=1 uses sample standard deviation (n-1 denominator)
-    std = float(sim_totals.std(ddof=1))
-    
-    # ========== VALUE AT RISK (VaR) ==========
-    # VaR at confidence level q: the loss amount L such that P(loss > L) = 1 - q
-    # Example: VaR at 0.95 = 95th percentile = worst case with 95% confidence
-    qs = {}
-    for q in quantiles:
-        # np.quantile computes percentile; q=0.95 returns 95th percentile value
-        var_q = float(np.quantile(sim_totals, q))
-        qs[f"var_{int(q*100)}"] = var_q
-    
-    # ========== LOSS PERCENTILES ==========
-    # Provide additional context: min, 25th, 75th percentiles
-    percentile_stats = {
+def summarize_sim(sim_totals: np.ndarray, quantiles=(0.5, 0.9, 0.95, 0.99)) -> dict:
+    qs = {f"var_{int(q*100)}": float(np.quantile(sim_totals, q)) for q in quantiles}
+    return {
+        "mean_loss": float(sim_totals.mean()),
+        "volatility": float(sim_totals.std(ddof=1)),
+        **qs,
         "min_loss": float(np.min(sim_totals)),
         "p25_loss": float(np.percentile(sim_totals, 25)),
         "p75_loss": float(np.percentile(sim_totals, 75)),
         "max_loss": float(np.max(sim_totals)),
     }
-    
-    # Assemble all metrics into output dictionary
-    out = {"mean_loss": mean, "volatility": std}
-    out.update(qs)  # Add VaR metrics
-    out.update(percentile_stats)  # Add percentiles
-    
-    return out
+
+
+def save_simulation(db_path: str, seed: int | None, n_sims: int, portfolio_size: int, sim_totals: np.ndarray, summary: dict) -> int:
+    with sqlite3.connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.executescript("""
+            CREATE TABLE IF NOT EXISTS simulation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                seed INTEGER,
+                n_sims INTEGER NOT NULL,
+                portfolio_size INTEGER NOT NULL,
+                mean_loss REAL,
+                volatility REAL,
+                var_90 REAL,
+                var_95 REAL,
+                var_99 REAL
+            );
+            CREATE TABLE IF NOT EXISTS simulation_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES simulation_runs(id),
+                total_loss REAL NOT NULL
+            );
+        """)
+        cur.execute("""
+            INSERT INTO simulation_runs
+                (created_at, seed, n_sims, portfolio_size, mean_loss, volatility, var_90, var_95, var_99)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            seed, n_sims, portfolio_size,
+            summary["mean_loss"], summary["volatility"],
+            summary["var_90"], summary["var_95"], summary["var_99"],
+        ))
+        run_id = cur.lastrowid
+        cur.executemany(
+            "INSERT INTO simulation_results (run_id, total_loss) VALUES (?, ?)",
+            [(run_id, float(v)) for v in sim_totals],
+        )
+        conn.commit()
+    return run_id
 
 
 def main():
-
-    # ========== PARSE COMMAND-LINE ARGUMENTS ==========
-    p = argparse.ArgumentParser(
-        description="Monte Carlo simulation of portfolio claims losses"
-    )
-    p.add_argument("--db", default="claims.db", help="SQLite DB path")
-    p.add_argument("--n-sims", type=int, default=10000, help="Number of simulations to run")
-    p.add_argument(
-        "--portfolio-size",
-        type=int,
-        default=None,
-        help="Portfolio size to simulate (defaults to historical n_policies)"
-    )
-    p.add_argument("--out-csv", default="simulated_totals.csv", help="Output CSV path")
+    p = argparse.ArgumentParser(description="Monte Carlo simulation of portfolio claims losses")
+    p.add_argument("--db", default="claims.db")
+    p.add_argument("--n-sims", type=int, default=10000)
+    p.add_argument("--portfolio-size", type=int, default=None, help="Total policies to simulate (defaults to historical size)")
+    p.add_argument("--out-csv", default="simulated_totals.csv")
+    p.add_argument("--seed", type=int, default=None)
     args = p.parse_args()
 
-    # ========== LOAD DATA ==========
-    # Load historical claims and portfolio metadata from database
-    df, meta = load_claims(args.db)
-    
-    # ========== FIT DISTRIBUTIONS ==========
-    # Fit Poisson parameter: claims per policy per year
-    lambda_per_policy = fit_frequency(df, meta)
-    
-    # Fit Gamma distribution to claim amounts (severity)
-    sev = fit_severity(df)
+    segment_params = load_segment_params(args.db)
 
-    # ========== DETERMINE PORTFOLIO SIZE ==========
-    # Use provided --portfolio-size or fall back to historical n_policies
-    if args.portfolio_size is None and "n_policies" in meta:
-        portfolio_size = int(meta["n_policies"])
-    elif args.portfolio_size is not None:
-        portfolio_size = args.portfolio_size
-    else:
-        raise RuntimeError("Provide --portfolio-size or include n_policies in DB meta")
+    print("Fitted segment parameters:")
+    for seg, params in segment_params.items():
+        print(f"  {seg:12s} lambda={params['lambda_per_policy']:.4f}  mu={params['mu']:.3f}  sigma={params['sigma']:.3f}  n_policies={params['n_policies']}")
 
-    # ========== DISPLAY PARAMETERS ==========
-    print(f"Estimated lambda_per_policy={lambda_per_policy:.6f}")
-    if sev is None:
-        print("No historical severities found; severity fit skipped.")
-    else:
-        print(f"Fitted severity: {sev}")
+    total_policies = sum(p["n_policies"] for p in segment_params.values())
+    portfolio_size = args.portfolio_size or total_policies
 
-    # ========== RUN SIMULATIONS ==========
-    # Execute Monte Carlo simulation
-    sim_totals = run_simulation(lambda_per_policy, sev, portfolio_size, args.n_sims)
-    
-    # ========== COMPUTE RISK METRICS ==========
-    # Calculate portfolio-level statistics: mean, volatility, VaR, percentiles
+    rng = np.random.default_rng(args.seed)
+    sim_totals = run_simulation(segment_params, portfolio_size, args.n_sims, rng=rng)
     summary = summarize_sim(sim_totals)
-    
-    # ========== DISPLAY RESULTS ==========
-    print("Portfolio Risk Metrics:")
+
+    print("\nPortfolio Risk Metrics:")
     print("=" * 50)
     for k, v in summary.items():
         print(f"  {k}: {v:,.2f}")
 
-    # ========== SAVE OUTPUTS ==========
-    # Save all simulated loss values to CSV (for further analysis/visualization)
+    run_id = save_simulation(args.db, args.seed, args.n_sims, portfolio_size, sim_totals, summary)
+    print(f"\nSaved run #{run_id} to {args.db}")
+
     pd.Series(sim_totals, name="total_loss").to_csv(args.out_csv, index=False)
-    print(f"\nWrote {len(sim_totals)} simulation results to {args.out_csv}")
+    print(f"Wrote {len(sim_totals)} simulation results to {args.out_csv}")
 
 
 if __name__ == "__main__":
-    # Run main simulation pipeline when script is executed directly
     main()

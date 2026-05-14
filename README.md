@@ -1,75 +1,90 @@
 
 # Monte Carlo Claims Model (SQL + Python)
 
-This project is a Monte Carlo simulator that models yearly insurance losses for a portfolio of policies. It uses a Poisson model to estimate how many claims happen and a fitted severity distribution (like Gamma) to estimate how large those claims are. By running thousands of simulations, the program shows how total losses can vary from year to year and helps visualise both the “typical” outcomes and the rare, more extreme ones. The goal is to give an intuitive understanding of how actuaries combine frequency severity models, aggregate losses, and risk measures like VaR and CVaR to assess portfolio risk and make decisions around pricing, capital, and reinsurance.
+This project is a Monte Carlo simulator that models yearly insurance losses across a segmented portfolio of policies (home, auto, commercial). It uses a Poisson model to estimate claim frequency and a fitted log-normal severity distribution to estimate claim size — fitted separately per segment from historical data stored in SQLite. By running thousands of simulations, the program generates a full portfolio loss distribution and risk metrics including VaR. Each simulation run is persisted back to the database for comparison across scenarios.
 
 **Contents**
 - `requirements.txt`: Python dependencies
-- `src/create_db.py`: generator to create a sample `claims.db` (SQLite)
-- `src/monte_carlo.py`: loads data, fits frequency/severity, runs Monte Carlo sims
-- `sample_claims.csv`: small sample export (for quick inspection)
-- `run.sh`: convenience runner (creates venv, installs deps, runs a smoke test)
+- `src/create_db.py`: generates `claims.db` with synthetic segmented claims history
+- `src/monte_carlo.py`: fits frequency/severity per segment, runs Monte Carlo sims, saves results to DB
+- `src/run.sh`: convenience runner (installs deps and runs a smoke test)
 
 **Quick Start (macOS / zsh)**
-- Clone the repo and move into it (quote path if it contains spaces):
+
+Install dependencies and run a smoke test:
 
 ```bash
-cd '/Users/mehul/Github Projects/monte_carlo_claims'
+pip3 install -r requirements.txt
+python3 src/create_db.py --out claims.db --n-policies 300 --n-years 3 --lambda-per-policy 0.1 --seed 1
+python3 src/monte_carlo.py --db claims.db --n-sims 5000 --seed 42
 ```
 
-- Create and activate a virtual environment, install dependencies, generate a small DB and run a short smoke test:
+Or use the included helper:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python src/create_db.py --out claims.db --n-policies 100 --n-years 1 --lambda-per-policy 0.05 --seed 1
-python src/monte_carlo.py --db claims.db --n-sims 1000 --portfolio-size 100
+bash src/run.sh
 ```
 
-- Or use the included helper (handles quoting and venv setup):
-
-```bash
-./run.sh
-```
-
-The `monte_carlo.py` script prints summary statistics (mean, std, VaR, CVaR) and writes `simulated_totals.csv` with simulation results.
+The `monte_carlo.py` script prints per-segment fitted parameters, summary risk metrics (mean, volatility, VaR), and saves results to both `claims.db` and `simulated_totals.csv`.
 
 **How SQL is used**
-- I used SQLite (`claims.db`) as the portable store for historical claims.
-- `create_db.py` creates two tables: `claims(id, policy_id, claim_date, amount)` and `meta(key,value)`.
-- `monte_carlo.py` reads those tables with `pandas.read_sql_query`, then fits distributions and runs simulations in memory.
+
+The database has five tables:
+
+| Table | Purpose |
+|---|---|
+| `policies(policy_id, segment)` | Maps each policy to its segment (home / auto / commercial) |
+| `claims(id, policy_id, claim_date, amount)` | Historical claim records with FK to policies |
+| `meta(key, value)` | Portfolio metadata (n_policies, n_years, base_lambda) |
+| `simulation_runs(id, created_at, seed, n_sims, portfolio_size, mean_loss, ...)` | One row per simulation run with summary metrics |
+| `simulation_results(id, run_id, total_loss)` | Every simulated loss value, linked to its run |
+
+SQL does meaningful work in three places:
+
+1. **Per-segment policy counts** — `COUNT(*) ... GROUP BY segment` on the `policies` table
+2. **Per-segment claim counts** — `LEFT JOIN claims ON policies` + `GROUP BY segment` to compute lambda per segment
+3. **Per-segment claim amounts** — `JOIN` between `claims` and `policies` to pull amounts per segment for log-normal fitting
+4. **Storing simulation outputs** — each run is written back to `simulation_runs` and `simulation_results`, so you can query and compare runs across different seeds or portfolio sizes
+
+**Policy segments**
+
+Policies are split evenly across three segments, each with different risk profiles:
+
+| Segment | Lambda multiplier | Severity |
+|---|---|---|
+| home | 1.0× base | Medium frequency, heavy tail |
+| auto | 1.5× base | Higher frequency, smaller claims |
+| commercial | 0.5× base | Lower frequency, very large claims |
+
+Frequency and severity are fitted independently per segment from historical data using SQL GROUP BY queries.
 
 **Viewing the DB**
 - Use the VS Code SQLite extension or DB Browser for SQLite to open `claims.db`
-- Quick CLI preview (no GUI):
+- Quick CLI preview:
 
 ```bash
 sqlite3 claims.db ".schema"
 sqlite3 -header -csv claims.db "SELECT * FROM claims LIMIT 20;"
 ```
 
-You can export a small CSV for sharing:
+Query simulation run history:
 
 ```bash
-sqlite3 -header -csv claims.db "SELECT * FROM claims LIMIT 500;" > sample_claims.csv
+sqlite3 -header claims.db "SELECT id, created_at, seed, n_sims, mean_loss, var_95 FROM simulation_runs;"
 ```
 
 ## Playing With the Inputs
-
-You can change how the simulator behaves by tweaking the inputs passed into `create_db.py` and `monte_carlo.py`. This lets you explore how different assumptions affect claim frequency, claim severity, and the overall loss distribution.
 
 ### 1. Change the number of policies
 
 More policies → more expected claims → higher aggregate losses.
 ```bash
-python src/create_db.py --out claims.db --n-policies 2000 --n-years 10 --lambda-per-policy 0.05 --seed 1
+python3 src/create_db.py --out claims.db --n-policies 2000 --n-years 10 --lambda-per-policy 0.1 --seed 1
 ```
 
-### 2. Adjust the claim frequency (λ)
+### 2. Adjust the base claim frequency (λ)
 
-`--lambda-per-policy` controls how often each policy generates claims per year.
+`--lambda-per-policy` is the base rate, scaled per segment (auto gets 1.5×, commercial gets 0.5×).
 
 **Low frequency (rare events):**
 ```bash
@@ -81,64 +96,44 @@ python src/create_db.py --out claims.db --n-policies 2000 --n-years 10 --lambda-
 --lambda-per-policy 0.2
 ```
 
-λ has one of the biggest impacts on total losses — higher λ means more claims, which pushes the entire loss distribution upward.
-
 ### 3. Change the number of simulations
 
 More simulations → smoother and more reliable distribution estimates.
 ```bash
-python src/monte_carlo.py --db claims.db --n-sims 5000 --portfolio-size 100
+python3 src/monte_carlo.py --db claims.db --n-sims 10000 --seed 42
 ```
 
 - **Low `n_sims`** (e.g., 500): fast but noisy
-- **High `n_sims`** (e.g., 5000+): slower but more stable tail metrics (VaR, CVaR)
+- **High `n_sims`** (e.g., 10000+): slower but more stable tail metrics
 
 ### 4. Vary the portfolio size
 
-`--portfolio-size` is how many policies you model during the simulation, not in the database.
+`--portfolio-size` sets the total policies to simulate. Each segment's share is scaled proportionally to its historical share.
 ```bash
-python src/monte_carlo.py --db claims.db --portfolio-size 500
+python3 src/monte_carlo.py --db claims.db --portfolio-size 5000 --seed 42
 ```
 
-**Effects:**
-- Large portfolios → smoother results (law of large numbers)
-- Small portfolios → more volatility and more extreme outcomes
+### 5. Try stress-test scenarios
 
-### 5. Change the random seed
-
-Different seeds produce different synthetic claim histories.
+#### A. High frequency across all segments
 ```bash
---seed 42
+python3 src/create_db.py --out claims.db --n-policies 1000 --n-years 10 --lambda-per-policy 0.3 --seed 5
+python3 src/monte_carlo.py --db claims.db --n-sims 5000 --seed 5
 ```
 
-**Use this when:**
-- you want reproducible results
-- you're exploring sensitivity to stochastic variation
-
-### 6. Try stress-test scenarios
-
-#### A. High frequency + heavy severity
-Simulates a rough underwriting year with many claims:
+#### B. Compare two runs across seeds
 ```bash
-python src/create_db.py --out claims.db --n-policies 1000 --n-years 10 --lambda-per-policy 0.2 --seed 5
-python src/monte_carlo.py --db claims.db --n-sims 2000 --portfolio-size 1000
+python3 src/monte_carlo.py --db claims.db --n-sims 5000 --seed 1
+python3 src/monte_carlo.py --db claims.db --n-sims 5000 --seed 99
+sqlite3 -header claims.db "SELECT id, seed, mean_loss, var_95 FROM simulation_runs;"
 ```
-
-#### B. Rare but very costly claims
-Frequency is low, but severity drives risk:
-```bash
-python src/create_db.py --out claims.db --n-policies 1000 --n-years 10 --lambda-per-policy 0.01 --seed 7
-```
-
-Use this to see how "long-tail" risk shows up in VaR and CVaR metrics.
 
 ### What to look for while experimenting
 
-- **Mean vs Median** → shows right-skew from severity
-- **VaR / CVaR** → behaviour of the extreme tail
-- **Standard deviation** → overall volatility
-- **Portfolio size effects** → diversification benefit
-- **Sensitivity to λ** → how claim frequency shifts the entire risk profile
+- **Segment differences** → auto drives frequency, commercial drives tail severity
+- **Mean vs Median** → right-skew from log-normal severity
+- **VaR 95 / 99** → behaviour of the extreme tail
+- **Portfolio size effects** → diversification benefit as n_policies grows
+- **Run history** → compare mean_loss and var_95 across runs in simulation_runs table
 
 Playing with these inputs builds intuition for how actuaries explore uncertainty, test pricing assumptions, and understand capital needs.
-
